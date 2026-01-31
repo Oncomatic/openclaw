@@ -107,6 +107,7 @@ export function derivePromptTokens(usage?: {
 export function deriveSessionTotalTokens(params: {
   usage?: {
     input?: number;
+    output?: number;
     total?: number;
     cacheRead?: number;
     cacheWrite?: number;
@@ -122,6 +123,10 @@ export function deriveSessionTotalTokens(params: {
     return undefined;
   }
   const input = usage?.input ?? 0;
+  const output = usage?.output ?? 0;
+
+  // Prefer a prompt token override if the caller provides one.
+  // Otherwise, derive prompt tokens from input + cache read/write.
   const promptTokens = hasPromptOverride
     ? promptOverride
     : derivePromptTokens({
@@ -129,7 +134,11 @@ export function deriveSessionTotalTokens(params: {
         cacheRead: usage?.cacheRead,
         cacheWrite: usage?.cacheWrite,
       });
-  let total = promptTokens ?? usage?.total ?? input;
+
+  // Total tokens should reflect prompt + completion when possible.
+  let total =
+    promptTokens !== undefined ? promptTokens + output : (usage?.total ?? input + output);
+
   if (!(total > 0)) {
     return undefined;
   }
