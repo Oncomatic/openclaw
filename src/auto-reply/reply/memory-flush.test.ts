@@ -259,7 +259,7 @@ describe("memory flush prompt estimates", () => {
 });
 
 describe("memory flush transcript fallback", () => {
-  it("sums usage entries from the session transcript", async () => {
+  it("uses the last usage entry from the session transcript", async () => {
     const tmp = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-flush-"));
     const logPath = path.join(tmp, "session.jsonl");
     const lines = [
@@ -276,7 +276,7 @@ describe("memory flush transcript fallback", () => {
     };
     const total = await readPromptTokensFromSessionLog("session", sessionEntry);
 
-    expect(total).toBe(50);
+    expect(total).toBe(10);
   });
 });
 
