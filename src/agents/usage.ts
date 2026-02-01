@@ -135,9 +135,14 @@ export function deriveSessionTotalTokens(params: {
         cacheWrite: usage?.cacheWrite,
       });
 
-  // Total tokens should reflect prompt + completion when possible.
-  let total =
-    promptTokens !== undefined ? promptTokens + output : (usage?.total ?? input + output);
+  const derivedTotal = promptTokens !== undefined ? promptTokens + output : input + output;
+  const usageTotal =
+    typeof usage?.total === "number" && Number.isFinite(usage.total) && usage.total > 0
+      ? usage.total
+      : undefined;
+
+  // Pick whichever estimate is larger to avoid undercounting.
+  let total = usageTotal !== undefined ? Math.max(usageTotal, derivedTotal) : derivedTotal;
 
   if (!(total > 0)) {
     return undefined;
