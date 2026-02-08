@@ -118,10 +118,12 @@ export function deriveSessionTotalTokens(params: {
   const promptOverride = params.promptTokens;
   const hasPromptOverride =
     typeof promptOverride === "number" && Number.isFinite(promptOverride) && promptOverride > 0;
+
   const usage = params.usage;
   if (!usage && !hasPromptOverride) {
     return undefined;
   }
+
   const input = usage?.input ?? 0;
   const output = usage?.output ?? 0;
 
@@ -142,7 +144,7 @@ export function deriveSessionTotalTokens(params: {
       : undefined;
 
   // Pick whichever estimate is larger to avoid undercounting.
-  let total = usageTotal !== undefined ? Math.max(usageTotal, derivedTotal) : derivedTotal;
+  const total = usageTotal !== undefined ? Math.max(usageTotal, derivedTotal) : derivedTotal;
 
   if (!(total > 0)) {
     return undefined;
