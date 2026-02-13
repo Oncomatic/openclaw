@@ -48,19 +48,28 @@ export function estimatePromptTokensForMemoryFlush(prompt?: string): number | un
 }
 
 export function resolveEffectivePromptTokens(
-  baseTotalTokens?: number,
-  transcriptTotalTokens?: number,
+  basePromptTokens?: number,
+  lastOutputTokens?: number,
   promptTokenEstimate?: number,
 ): number {
-  const lastPromptTokens = Math.max(baseTotalTokens ?? 0, transcriptTotalTokens ?? 0);
-  return promptTokenEstimate ? lastPromptTokens + promptTokenEstimate : lastPromptTokens;
+  const base = Math.max(0, basePromptTokens ?? 0);
+  const output = Math.max(0, lastOutputTokens ?? 0);
+  const estimate = Math.max(0, promptTokenEstimate ?? 0);
+  // Flush gating projects the next input context by adding the previous
+  // completion and the current user prompt estimate.
+  return base + output + estimate;
 }
+
+export type SessionTranscriptUsageSnapshot = {
+  promptTokens?: number;
+  outputTokens?: number;
+};
 
 export async function readPromptTokensFromSessionLog(
   sessionId?: string,
   sessionEntry?: SessionEntry,
   sessionKey?: string,
-): Promise<number | undefined> {
+): Promise<SessionTranscriptUsageSnapshot | undefined> {
   if (!sessionId) {
     return undefined;
   }
@@ -97,14 +106,22 @@ export async function readPromptTokensFromSessionLog(
     if (!lastUsage) {
       return undefined;
     }
-    const promptTokens = derivePromptTokens(lastUsage) ?? lastUsage.input ?? 0;
-    const outputTokens = lastUsage.output ?? 0;
-    const usageTotal = lastUsage.total;
-    if (typeof usageTotal === "number" && Number.isFinite(usageTotal) && usageTotal > 0) {
-      return usageTotal;
+
+    const promptTokens = derivePromptTokens(lastUsage);
+    const outputRaw = lastUsage.output;
+    const outputTokens =
+      typeof outputRaw === "number" && Number.isFinite(outputRaw) && outputRaw > 0
+        ? outputRaw
+        : undefined;
+
+    if (!(typeof promptTokens === "number") && !(typeof outputTokens === "number")) {
+      return undefined;
     }
-    const derivedTotalTokens = promptTokens + outputTokens;
-    return derivedTotalTokens > 0 ? derivedTotalTokens : undefined;
+
+    return {
+      promptTokens,
+      outputTokens,
+    };
   } catch {
     return undefined;
   }
@@ -158,20 +175,39 @@ export async function runMemoryFlushIfNeeded(params: {
   const promptTokenEstimate = estimatePromptTokensForMemoryFlush(
     params.promptForEstimate ?? params.followupRun.prompt,
   );
-  let baseTotalTokens = entry?.totalTokens;
-  const hasBaseTotalTokens =
-    typeof baseTotalTokens === "number" && Number.isFinite(baseTotalTokens) && baseTotalTokens > 0;
-  const shouldReadTranscript = canAttemptFlush && entry && !hasBaseTotalTokens;
-  const transcriptTotalTokens = shouldReadTranscript
+  const persistedPromptTokensRaw = entry?.totalTokens;
+  const persistedPromptTokens =
+    typeof persistedPromptTokensRaw === "number" &&
+    Number.isFinite(persistedPromptTokensRaw) &&
+    persistedPromptTokensRaw > 0
+      ? persistedPromptTokensRaw
+      : undefined;
+  const hasFreshPersistedPromptTokens =
+    typeof persistedPromptTokens === "number" && entry?.totalTokensFresh === true;
+
+  // When totals are stale/unknown, derive prompt + last output from transcript
+  // so memory flush can still be evaluated against projected next-input size.
+  const shouldReadTranscript = canAttemptFlush && entry && !hasFreshPersistedPromptTokens;
+  const transcriptUsageSnapshot = shouldReadTranscript
     ? await readPromptTokensFromSessionLog(
         params.followupRun.run.sessionId,
         entry,
         params.sessionKey ?? params.followupRun.run.sessionKey,
       )
     : undefined;
-  const derivedTotalTokens = Math.max(baseTotalTokens ?? 0, transcriptTotalTokens ?? 0);
-  if (entry && derivedTotalTokens > (baseTotalTokens ?? 0)) {
-    const nextEntry = { ...entry, totalTokens: derivedTotalTokens };
+  const transcriptPromptTokens = transcriptUsageSnapshot?.promptTokens;
+  const transcriptOutputTokens = transcriptUsageSnapshot?.outputTokens;
+  const hasReliableTranscriptPromptTokens =
+    typeof transcriptPromptTokens === "number" &&
+    Number.isFinite(transcriptPromptTokens) &&
+    transcriptPromptTokens > 0;
+
+  if (entry && hasReliableTranscriptPromptTokens) {
+    const nextEntry = {
+      ...entry,
+      totalTokens: transcriptPromptTokens,
+      totalTokensFresh: true,
+    };
     entry = nextEntry;
     if (params.sessionKey && params.sessionStore) {
       params.sessionStore[params.sessionKey] = nextEntry;
@@ -181,7 +217,7 @@ export async function runMemoryFlushIfNeeded(params: {
         const updatedEntry = await updateSessionStoreEntry({
           storePath: params.storePath,
           sessionKey: params.sessionKey,
-          update: async () => ({ totalTokens: derivedTotalTokens }),
+          update: async () => ({ totalTokens: transcriptPromptTokens, totalTokensFresh: true }),
         });
         if (updatedEntry) {
           entry = updatedEntry;
@@ -190,23 +226,24 @@ export async function runMemoryFlushIfNeeded(params: {
           }
         }
       } catch (err) {
-        logVerbose(`failed to persist derived totalTokens: ${String(err)}`);
+        logVerbose(`failed to persist derived prompt totalTokens: ${String(err)}`);
       }
     }
-    baseTotalTokens = entry.totalTokens;
   }
-  const effectivePromptTokens = resolveEffectivePromptTokens(
-    baseTotalTokens,
-    transcriptTotalTokens,
+
+  const basePromptTokens = Math.max(persistedPromptTokens ?? 0, transcriptPromptTokens ?? 0);
+  const projectedTokenCount = resolveEffectivePromptTokens(
+    basePromptTokens,
+    transcriptOutputTokens,
     promptTokenEstimate,
   );
-  const effectiveEntry =
-    entry && typeof effectivePromptTokens === "number" && effectivePromptTokens > 0
-      ? { ...entry, totalTokens: effectivePromptTokens }
+  const flushDecisionEntry =
+    entry && projectedTokenCount > 0
+      ? { ...entry, totalTokens: projectedTokenCount, totalTokensFresh: true }
       : entry;
 
-  // Diagnostic logging to understand why memory flush may not trigger
-  const totalTokens = effectiveEntry?.totalTokens;
+  // Diagnostic logging to understand why memory flush may not trigger.
+  const totalTokens = flushDecisionEntry?.totalTokens;
   const threshold =
     contextWindowTokens -
     memoryFlushSettings.reserveTokensFloor -
@@ -215,8 +252,10 @@ export async function runMemoryFlushIfNeeded(params: {
     `memoryFlush check: sessionKey=${params.sessionKey} totalTokens=${totalTokens ?? "undefined"} ` +
       `contextWindow=${contextWindowTokens} threshold=${threshold} ` +
       `isHeartbeat=${params.isHeartbeat} isCli=${isCli} memoryFlushWritable=${memoryFlushWritable} ` +
-      `compactionCount=${effectiveEntry?.compactionCount ?? 0} memoryFlushCompactionCount=${effectiveEntry?.memoryFlushCompactionCount ?? "undefined"} ` +
-      `promptTokensEst=${promptTokenEstimate ?? "undefined"} transcriptTotalTokens=${transcriptTotalTokens ?? "undefined"}`,
+      `compactionCount=${flushDecisionEntry?.compactionCount ?? 0} memoryFlushCompactionCount=${flushDecisionEntry?.memoryFlushCompactionCount ?? "undefined"} ` +
+      `persistedPromptTokens=${persistedPromptTokens ?? "undefined"} persistedFresh=${entry?.totalTokensFresh === true} ` +
+      `promptTokensEst=${promptTokenEstimate ?? "undefined"} transcriptPromptTokens=${transcriptPromptTokens ?? "undefined"} transcriptOutputTokens=${transcriptOutputTokens ?? "undefined"} ` +
+      `projectedTokenCount=${projectedTokenCount || "undefined"}`,
   );
 
   const shouldFlushMemory =
@@ -225,7 +264,7 @@ export async function runMemoryFlushIfNeeded(params: {
     !params.isHeartbeat &&
     !isCli &&
     shouldRunMemoryFlush({
-      entry: effectiveEntry,
+      entry: flushDecisionEntry,
       contextWindowTokens,
       reserveTokensFloor: memoryFlushSettings.reserveTokensFloor,
       softThresholdTokens: memoryFlushSettings.softThresholdTokens,

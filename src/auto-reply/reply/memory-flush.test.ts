@@ -247,8 +247,8 @@ describe("memory flush prompt estimates", () => {
     expect(Number.isInteger(estimate)).toBe(true);
   });
 
-  it("adds the estimate to the larger of stored and transcript totals", () => {
-    expect(resolveEffectivePromptTokens(120, 200, 30)).toBe(230);
+  it("projects base prompt + last output + current prompt estimate", () => {
+    expect(resolveEffectivePromptTokens(120, 20, 30)).toBe(170);
   });
 });
 
@@ -268,12 +268,12 @@ describe("memory flush transcript fallback", () => {
       updatedAt: Date.now(),
       sessionFile: logPath,
     };
-    const total = await readPromptTokensFromSessionLog("session", sessionEntry);
+    const snapshot = await readPromptTokensFromSessionLog("session", sessionEntry);
 
-    expect(total).toBe(10);
+    expect(snapshot).toEqual({ promptTokens: 6, outputTokens: 4 });
   });
 
-  it("falls back to derived prompt/output total when usage total is a zero placeholder", async () => {
+  it("derives prompt/output snapshot when usage.total is a zero placeholder", async () => {
     const tmp = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-flush-"));
     const logPath = path.join(tmp, "session.jsonl");
     const lines = [JSON.stringify({ usage: { total: 0, input: 80, output: 20 } })];
@@ -284,9 +284,9 @@ describe("memory flush transcript fallback", () => {
       updatedAt: Date.now(),
       sessionFile: logPath,
     };
-    const total = await readPromptTokensFromSessionLog("session", sessionEntry);
+    const snapshot = await readPromptTokensFromSessionLog("session", sessionEntry);
 
-    expect(total).toBe(100);
+    expect(snapshot).toEqual({ promptTokens: 80, outputTokens: 20 });
   });
 
   it("ignores trailing zero-usage transcript lines", async () => {
@@ -303,14 +303,14 @@ describe("memory flush transcript fallback", () => {
       updatedAt: Date.now(),
       sessionFile: logPath,
     };
-    const total = await readPromptTokensFromSessionLog("session", sessionEntry);
+    const snapshot = await readPromptTokensFromSessionLog("session", sessionEntry);
 
-    expect(total).toBe(120);
+    expect(snapshot).toEqual({ promptTokens: 100, outputTokens: 20 });
   });
 });
 
 describe("runMemoryFlushIfNeeded transcript fallback", () => {
-  it("uses transcript totals and prompt estimate to trigger flush and persists totals", async () => {
+  it("uses transcript prompt/output when totalTokensFresh is false and only persists prompt tokens", async () => {
     runWithModelFallbackMock.mockImplementation(
       async ({
         provider,
@@ -330,10 +330,11 @@ describe("runMemoryFlushIfNeeded transcript fallback", () => {
 
     const tmp = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-flush-"));
     const logPath = path.join(tmp, "session.jsonl");
-    const transcriptTotalTokens = 40;
+    const transcriptPromptTokens = 40;
+    const transcriptOutputTokens = 20;
     await fsPromises.writeFile(
       logPath,
-      JSON.stringify({ usage: { total: transcriptTotalTokens } }),
+      JSON.stringify({ usage: { input: transcriptPromptTokens, output: transcriptOutputTokens } }),
       "utf-8",
     );
 
@@ -343,6 +344,8 @@ describe("runMemoryFlushIfNeeded transcript fallback", () => {
       sessionId: "session",
       updatedAt: Date.now(),
       sessionFile: logPath,
+      totalTokens: 5,
+      totalTokensFresh: false,
       compactionCount: 0,
     };
     await fsPromises.writeFile(
@@ -361,7 +364,8 @@ describe("runMemoryFlushIfNeeded transcript fallback", () => {
 
     const reserveTokensFloor = 1;
     const softThresholdTokens = 1;
-    const threshold = transcriptTotalTokens + estimate - 1;
+    const projected = transcriptPromptTokens + transcriptOutputTokens + estimate;
+    const threshold = projected - 1;
     const contextWindowTokens = threshold + reserveTokensFloor + softThresholdTokens;
     const cfg = {
       agents: {
@@ -399,7 +403,101 @@ describe("runMemoryFlushIfNeeded transcript fallback", () => {
     expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
 
     const stored = JSON.parse(await fsPromises.readFile(storePath, "utf-8"));
-    expect(stored[sessionKey].totalTokens).toBe(transcriptTotalTokens);
+    expect(stored[sessionKey].totalTokens).toBe(transcriptPromptTokens);
+    expect(stored[sessionKey].totalTokensFresh).toBe(true);
+    expect(stored[sessionKey].totalTokens).not.toBe(projected);
+  });
+
+  it("uses transcript fallback when totalTokensFresh is missing", async () => {
+    runWithModelFallbackMock.mockImplementation(
+      async ({
+        provider,
+        model,
+        run,
+      }: {
+        provider: string;
+        model: string;
+        run: (provider: string, model: string) => Promise<unknown>;
+      }) => ({
+        result: await run(provider, model),
+        provider,
+        model,
+      }),
+    );
+    runEmbeddedPiAgentMock.mockResolvedValue({ payloads: [], meta: {} });
+
+    const tmp = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-flush-"));
+    const logPath = path.join(tmp, "session.jsonl");
+    await fsPromises.writeFile(
+      logPath,
+      JSON.stringify({ usage: { input: 30, output: 10 } }),
+      "utf-8",
+    );
+
+    const storePath = path.join(tmp, "sessions.json");
+    const sessionKey = "main";
+    const sessionEntry = {
+      sessionId: "session",
+      updatedAt: Date.now(),
+      sessionFile: logPath,
+      totalTokens: 25,
+      compactionCount: 0,
+    };
+    await fsPromises.writeFile(
+      storePath,
+      JSON.stringify({ [sessionKey]: sessionEntry }, null, 2),
+      "utf-8",
+    );
+
+    const promptText = "store memory";
+    const estimate = estimatePromptTokensForMemoryFlush(promptText);
+    expect(estimate).toBeTypeOf("number");
+    expect(estimate).toBeGreaterThan(0);
+    if (!estimate) {
+      throw new Error("Expected prompt estimate");
+    }
+
+    const reserveTokensFloor = 1;
+    const softThresholdTokens = 1;
+    const projected = 30 + 10 + estimate;
+    const threshold = projected - 1;
+    const contextWindowTokens = threshold + reserveTokensFloor + softThresholdTokens;
+    const cfg = {
+      agents: {
+        defaults: {
+          compaction: {
+            reserveTokensFloor,
+            memoryFlush: { softThresholdTokens },
+          },
+        },
+      },
+    } as OpenClawConfig;
+    const followupRun = createFollowupRun({
+      cfg,
+      sessionId: "session",
+      sessionKey,
+      sessionFile: logPath,
+    });
+
+    await runMemoryFlushIfNeeded({
+      cfg,
+      followupRun,
+      promptForEstimate: promptText,
+      sessionCtx: baseSessionCtx,
+      defaultModel: "anthropic/claude-opus-4-5",
+      agentCfgContextTokens: contextWindowTokens,
+      resolvedVerboseLevel: "off",
+      sessionEntry,
+      sessionStore: { [sessionKey]: sessionEntry },
+      sessionKey,
+      storePath,
+      isHeartbeat: false,
+    });
+
+    expect(runWithModelFallbackMock).toHaveBeenCalledTimes(1);
+    const stored = JSON.parse(await fsPromises.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].totalTokens).toBe(30);
+    expect(stored[sessionKey].totalTokensFresh).toBe(true);
   });
 
   it.each([
