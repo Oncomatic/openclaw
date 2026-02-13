@@ -185,9 +185,28 @@ export async function runMemoryFlushIfNeeded(params: {
   const hasFreshPersistedPromptTokens =
     typeof persistedPromptTokens === "number" && entry?.totalTokensFresh === true;
 
-  // When totals are stale/unknown, derive prompt + last output from transcript
-  // so memory flush can still be evaluated against projected next-input size.
-  const shouldReadTranscript = canAttemptFlush && entry && !hasFreshPersistedPromptTokens;
+  const flushThreshold =
+    contextWindowTokens -
+    memoryFlushSettings.reserveTokensFloor -
+    memoryFlushSettings.softThresholdTokens;
+
+  // When totals are stale/unknown, derive prompt + last output from transcript so memory
+  // flush can still be evaluated against projected next-input size.
+  //
+  // When totals are fresh, only read the transcript when we're close enough to the
+  // threshold that missing the last output tokens could flip the decision.
+  const shouldReadTranscriptForOutput =
+    canAttemptFlush &&
+    entry &&
+    hasFreshPersistedPromptTokens &&
+    typeof promptTokenEstimate === "number" &&
+    Number.isFinite(promptTokenEstimate) &&
+    flushThreshold > 0 &&
+    (persistedPromptTokens ?? 0) + promptTokenEstimate >= flushThreshold - 1024;
+
+  const shouldReadTranscript =
+    canAttemptFlush && entry && (!hasFreshPersistedPromptTokens || shouldReadTranscriptForOutput);
+
   const transcriptUsageSnapshot = shouldReadTranscript
     ? await readPromptTokensFromSessionLog(
         params.followupRun.run.sessionId,
@@ -231,31 +250,38 @@ export async function runMemoryFlushIfNeeded(params: {
     }
   }
 
-  const basePromptTokens = Math.max(persistedPromptTokens ?? 0, transcriptPromptTokens ?? 0);
-  const projectedTokenCount = resolveEffectivePromptTokens(
-    basePromptTokens,
-    transcriptOutputTokens,
-    promptTokenEstimate,
+  const promptTokensSnapshot = Math.max(
+    hasFreshPersistedPromptTokens ? (persistedPromptTokens ?? 0) : 0,
+    hasReliableTranscriptPromptTokens ? (transcriptPromptTokens ?? 0) : 0,
   );
-  const flushDecisionEntry =
-    entry && projectedTokenCount > 0
-      ? { ...entry, totalTokens: projectedTokenCount, totalTokensFresh: true }
-      : entry;
+  const hasFreshPromptTokensSnapshot =
+    promptTokensSnapshot > 0 &&
+    (hasFreshPersistedPromptTokens || hasReliableTranscriptPromptTokens);
+
+  const projectedTokenCount = hasFreshPromptTokensSnapshot
+    ? resolveEffectivePromptTokens(
+        promptTokensSnapshot,
+        transcriptOutputTokens,
+        promptTokenEstimate,
+      )
+    : undefined;
+  const tokenCountForFlush =
+    typeof projectedTokenCount === "number" &&
+    Number.isFinite(projectedTokenCount) &&
+    projectedTokenCount > 0
+      ? projectedTokenCount
+      : undefined;
 
   // Diagnostic logging to understand why memory flush may not trigger.
-  const totalTokens = flushDecisionEntry?.totalTokens;
-  const threshold =
-    contextWindowTokens -
-    memoryFlushSettings.reserveTokensFloor -
-    memoryFlushSettings.softThresholdTokens;
   logVerbose(
-    `memoryFlush check: sessionKey=${params.sessionKey} totalTokens=${totalTokens ?? "undefined"} ` +
-      `contextWindow=${contextWindowTokens} threshold=${threshold} ` +
+    `memoryFlush check: sessionKey=${params.sessionKey} ` +
+      `tokenCount=${tokenCountForFlush ?? "undefined"} ` +
+      `contextWindow=${contextWindowTokens} threshold=${flushThreshold} ` +
       `isHeartbeat=${params.isHeartbeat} isCli=${isCli} memoryFlushWritable=${memoryFlushWritable} ` +
-      `compactionCount=${flushDecisionEntry?.compactionCount ?? 0} memoryFlushCompactionCount=${flushDecisionEntry?.memoryFlushCompactionCount ?? "undefined"} ` +
+      `compactionCount=${entry?.compactionCount ?? 0} memoryFlushCompactionCount=${entry?.memoryFlushCompactionCount ?? "undefined"} ` +
       `persistedPromptTokens=${persistedPromptTokens ?? "undefined"} persistedFresh=${entry?.totalTokensFresh === true} ` +
       `promptTokensEst=${promptTokenEstimate ?? "undefined"} transcriptPromptTokens=${transcriptPromptTokens ?? "undefined"} transcriptOutputTokens=${transcriptOutputTokens ?? "undefined"} ` +
-      `projectedTokenCount=${projectedTokenCount || "undefined"}`,
+      `projectedTokenCount=${projectedTokenCount ?? "undefined"}`,
   );
 
   const shouldFlushMemory =
@@ -264,7 +290,8 @@ export async function runMemoryFlushIfNeeded(params: {
     !params.isHeartbeat &&
     !isCli &&
     shouldRunMemoryFlush({
-      entry: flushDecisionEntry,
+      entry,
+      tokenCount: tokenCountForFlush,
       contextWindowTokens,
       reserveTokensFloor: memoryFlushSettings.reserveTokensFloor,
       softThresholdTokens: memoryFlushSettings.softThresholdTokens,
@@ -275,7 +302,7 @@ export async function runMemoryFlushIfNeeded(params: {
   }
 
   logVerbose(
-    `memoryFlush triggered: sessionKey=${params.sessionKey} totalTokens=${totalTokens} threshold=${threshold}`,
+    `memoryFlush triggered: sessionKey=${params.sessionKey} tokenCount=${tokenCountForFlush ?? "undefined"} threshold=${flushThreshold}`,
   );
 
   let activeSessionEntry = entry ?? params.sessionEntry;
