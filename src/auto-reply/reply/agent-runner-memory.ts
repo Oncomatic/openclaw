@@ -65,6 +65,10 @@ export type SessionTranscriptUsageSnapshot = {
   outputTokens?: number;
 };
 
+// Keep a generous near-threshold window so large assistant outputs still trigger
+// transcript reads in time to flip memory-flush gating when needed.
+const TRANSCRIPT_OUTPUT_READ_BUFFER_TOKENS = 8192;
+
 export async function readPromptTokensFromSessionLog(
   sessionId?: string,
   sessionEntry?: SessionEntry,
@@ -202,7 +206,8 @@ export async function runMemoryFlushIfNeeded(params: {
     typeof promptTokenEstimate === "number" &&
     Number.isFinite(promptTokenEstimate) &&
     flushThreshold > 0 &&
-    (persistedPromptTokens ?? 0) + promptTokenEstimate >= flushThreshold - 1024;
+    (persistedPromptTokens ?? 0) + promptTokenEstimate >=
+      flushThreshold - TRANSCRIPT_OUTPUT_READ_BUFFER_TOKENS;
 
   const shouldReadTranscript =
     canAttemptFlush && entry && (!hasFreshPersistedPromptTokens || shouldReadTranscriptForOutput);
@@ -220,8 +225,12 @@ export async function runMemoryFlushIfNeeded(params: {
     typeof transcriptPromptTokens === "number" &&
     Number.isFinite(transcriptPromptTokens) &&
     transcriptPromptTokens > 0;
+  const shouldPersistTranscriptPromptTokens =
+    hasReliableTranscriptPromptTokens &&
+    (!hasFreshPersistedPromptTokens ||
+      (transcriptPromptTokens ?? 0) > (persistedPromptTokens ?? 0));
 
-  if (entry && hasReliableTranscriptPromptTokens) {
+  if (entry && shouldPersistTranscriptPromptTokens) {
     const nextEntry = {
       ...entry,
       totalTokens: transcriptPromptTokens,

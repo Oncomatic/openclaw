@@ -500,6 +500,183 @@ describe("runMemoryFlushIfNeeded transcript fallback", () => {
     expect(stored[sessionKey].totalTokensFresh).toBe(true);
   });
 
+  it("does not overwrite fresh persisted prompt tokens with a smaller transcript prompt snapshot", async () => {
+    const tmp = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-flush-"));
+    const logPath = path.join(tmp, "session.jsonl");
+    const persistedPromptTokens = 120;
+    const transcriptPromptTokens = 80;
+    const transcriptOutputTokens = 40;
+    await fsPromises.writeFile(
+      logPath,
+      JSON.stringify({ usage: { input: transcriptPromptTokens, output: transcriptOutputTokens } }),
+      "utf-8",
+    );
+
+    const storePath = path.join(tmp, "sessions.json");
+    const sessionKey = "main";
+    const sessionEntry = {
+      sessionId: "session",
+      updatedAt: Date.now(),
+      sessionFile: logPath,
+      totalTokens: persistedPromptTokens,
+      totalTokensFresh: true,
+      compactionCount: 0,
+    };
+    await fsPromises.writeFile(
+      storePath,
+      JSON.stringify({ [sessionKey]: sessionEntry }, null, 2),
+      "utf-8",
+    );
+
+    const promptText = "Use transcript output tokens for gating only.";
+    const estimate = estimatePromptTokensForMemoryFlush(promptText);
+    expect(estimate).toBeTypeOf("number");
+    expect(estimate).toBeGreaterThan(0);
+    if (!estimate) {
+      throw new Error("Expected prompt estimate");
+    }
+
+    const reserveTokensFloor = 1;
+    const softThresholdTokens = 1;
+    const projected = persistedPromptTokens + transcriptOutputTokens + estimate;
+    const threshold = projected + 200;
+    const contextWindowTokens = threshold + reserveTokensFloor + softThresholdTokens;
+    const cfg = {
+      agents: {
+        defaults: {
+          compaction: {
+            reserveTokensFloor,
+            memoryFlush: { softThresholdTokens },
+          },
+        },
+      },
+    } as OpenClawConfig;
+    const followupRun = createFollowupRun({
+      cfg,
+      sessionId: "session",
+      sessionKey,
+      sessionFile: logPath,
+    });
+
+    await runMemoryFlushIfNeeded({
+      cfg,
+      followupRun,
+      promptForEstimate: promptText,
+      sessionCtx: baseSessionCtx,
+      defaultModel: "anthropic/claude-opus-4-5",
+      agentCfgContextTokens: contextWindowTokens,
+      resolvedVerboseLevel: "off",
+      sessionEntry,
+      sessionStore: { [sessionKey]: sessionEntry },
+      sessionKey,
+      storePath,
+      isHeartbeat: false,
+    });
+
+    expect(runWithModelFallbackMock).not.toHaveBeenCalled();
+    const stored = JSON.parse(await fsPromises.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].totalTokens).toBe(persistedPromptTokens);
+    expect(stored[sessionKey].totalTokensFresh).toBe(true);
+  });
+
+  it("reads transcript near threshold and triggers flush when large output tokens flip projected usage", async () => {
+    runWithModelFallbackMock.mockImplementation(
+      async ({
+        provider,
+        model,
+        run,
+      }: {
+        provider: string;
+        model: string;
+        run: (provider: string, model: string) => Promise<unknown>;
+      }) => ({
+        result: await run(provider, model),
+        provider,
+        model,
+      }),
+    );
+    runEmbeddedPiAgentMock.mockResolvedValue({ payloads: [], meta: {} });
+
+    const tmp = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-flush-"));
+    const logPath = path.join(tmp, "session.jsonl");
+    const persistedPromptTokens = 90_000;
+    const transcriptPromptTokens = 85_000;
+    const transcriptOutputTokens = 8_000;
+    await fsPromises.writeFile(
+      logPath,
+      JSON.stringify({ usage: { input: transcriptPromptTokens, output: transcriptOutputTokens } }),
+      "utf-8",
+    );
+
+    const storePath = path.join(tmp, "sessions.json");
+    const sessionKey = "main";
+    const sessionEntry = {
+      sessionId: "session",
+      updatedAt: Date.now(),
+      sessionFile: logPath,
+      totalTokens: persistedPromptTokens,
+      totalTokensFresh: true,
+      compactionCount: 0,
+    };
+    await fsPromises.writeFile(
+      storePath,
+      JSON.stringify({ [sessionKey]: sessionEntry }, null, 2),
+      "utf-8",
+    );
+
+    const promptText = "Use projected context tokens to gate memory flush.";
+    const estimate = estimatePromptTokensForMemoryFlush(promptText);
+    expect(estimate).toBeTypeOf("number");
+    expect(estimate).toBeGreaterThan(0);
+    if (!estimate) {
+      throw new Error("Expected prompt estimate");
+    }
+
+    const reserveTokensFloor = 1;
+    const softThresholdTokens = 1;
+    const baselineWithoutOutput = persistedPromptTokens + estimate;
+    const threshold = baselineWithoutOutput + Math.floor(transcriptOutputTokens / 2);
+    const contextWindowTokens = threshold + reserveTokensFloor + softThresholdTokens;
+    const cfg = {
+      agents: {
+        defaults: {
+          compaction: {
+            reserveTokensFloor,
+            memoryFlush: { softThresholdTokens },
+          },
+        },
+      },
+    } as OpenClawConfig;
+    const followupRun = createFollowupRun({
+      cfg,
+      sessionId: "session",
+      sessionKey,
+      sessionFile: logPath,
+    });
+
+    await runMemoryFlushIfNeeded({
+      cfg,
+      followupRun,
+      promptForEstimate: promptText,
+      sessionCtx: baseSessionCtx,
+      defaultModel: "anthropic/claude-opus-4-5",
+      agentCfgContextTokens: contextWindowTokens,
+      resolvedVerboseLevel: "off",
+      sessionEntry,
+      sessionStore: { [sessionKey]: sessionEntry },
+      sessionKey,
+      storePath,
+      isHeartbeat: false,
+    });
+
+    expect(runWithModelFallbackMock).toHaveBeenCalledTimes(1);
+    expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
+
+    const stored = JSON.parse(await fsPromises.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].totalTokens).toBe(persistedPromptTokens);
+    expect(stored[sessionKey].totalTokensFresh).toBe(true);
+  });
+
   it.each([
     { label: "CLI provider", provider: "codex-cli", isHeartbeat: false },
     { label: "heartbeat", provider: "anthropic", isHeartbeat: true },
